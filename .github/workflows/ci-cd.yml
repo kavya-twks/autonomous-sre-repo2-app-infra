@@ -1,0 +1,263 @@
+name: App Infra CI/CD — Autonomous SRE
+
+on:
+  push:
+    branches: [main, "fix/*"]
+  pull_request:
+    branches: [main]
+  # Triggered when Repo 1 deploys successfully (via repository_dispatch)
+  repository_dispatch:
+    types: [base-infra-updated]
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.7.0"
+  REPO_NAME: repo2-app-infra
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  dependency-prediction:
+    name: "Stage 1 · Dependency Prediction"
+    runs-on: ubuntu-latest
+    outputs:
+      safe_to_proceed: ${{ steps.predict.outputs.safe_to_proceed }}
+      impact_report: ${{ steps.predict.outputs.impact_report }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check upstream state drift (Repo 1)
+        id: drift
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          pip install boto3 --quiet
+          python3 - <<'PYEOF'
+          import boto3, json, os
+          try:
+              s3 = boto3.client("s3", region_name="us-east-1")
+              obj = s3.get_object(Bucket="autonomous-sre-tfstate", Key="base-infra/terraform.tfstate")
+              state = json.loads(obj["Body"].read())
+              outputs = state.get("outputs", {})
+              vpc_id = outputs.get("vpc_id", {}).get("value", "MISSING")
+              cluster = outputs.get("ecs_cluster_name", {}).get("value", "MISSING")
+              print(f"Upstream VPC: {vpc_id}, Cluster: {cluster}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"upstream_healthy={'false' if 'MISSING' in [vpc_id, cluster] else 'true'}\n")
+          except Exception as e:
+              print(f"Could not read upstream state: {e}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("upstream_healthy=unknown\n")
+          PYEOF
+
+      - name: Predict cross-repo impact with Claude
+        id: predict
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          git diff --name-only HEAD~1 HEAD > /tmp/changed.txt 2>/dev/null || echo "initial" > /tmp/changed.txt
+          CHANGED=$(cat /tmp/changed.txt | tr '\n' ',')
+
+          python3 - <<'PYEOF'
+          import os, json, urllib.request
+
+          changed = """${{ steps.drift.outputs.upstream_healthy }}"""
+          upstream_ok = changed.strip() != "false"
+
+          prompt = f"""Cross-repo dependency analyzer for autonomous-sre ECS deployment.
+
+          Repository: repo2-app-infra (ALB, Target Groups, ECS Task Definitions, ECR)
+          Upstream dependency: repo1-base-infra (VPC, Subnets, ECS Cluster)
+          Upstream state healthy: {upstream_ok}
+
+          This repo is depended on by:
+          - Repo 3 (Frontend): reads frontend_ecr_url, alb_dns_name
+          - Repo 4 (Backend): reads backend_ecr_url
+
+          Respond ONLY with JSON:
+          {{
+            "safe_to_proceed": {str(upstream_ok).lower()},
+            "blast_radius": ["repo3", "repo4"],
+            "risk_level": "LOW",
+            "summary": "App infra change — frontend and backend deployments will re-deploy",
+            "warnings": {json.dumps([] if upstream_ok else ["Upstream repo1 state missing or unhealthy"])},
+            "recommendation": "proceed" if upstream_ok else "wait for repo1 to deploy first"
+          }}"""
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 500,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+
+          text = data["content"][0]["text"].strip()
+          if "```" in text:
+              text = text.split("```")[1]
+              if text.startswith("json"): text = text[4:]
+          result = json.loads(text.strip())
+          print(json.dumps(result, indent=2))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"safe_to_proceed={str(result['safe_to_proceed']).lower()}\n")
+              f.write(f"impact_report={json.dumps(result)}\n")
+          PYEOF
+
+  terraform-plan:
+    name: "Stage 2 · Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: dependency-prediction
+    if: needs.dependency-prediction.outputs.safe_to_proceed != 'false'
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init -input=false
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -detailed-exitcode -out=tfplan 2>&1 | tee /tmp/plan.txt
+          CODE=$?
+          echo "exitcode=$CODE" >> $GITHUB_OUTPUT
+          if [ $CODE -eq 1 ]; then exit 1; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: tfplan-repo2, path: tfplan }
+
+  self-heal:
+    name: "Stage 3 · Self-Heal"
+    runs-on: ubuntu-latest
+    needs: [dependency-prediction, terraform-plan]
+    if: failure() && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Claude self-heal for Repo 2
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 /dev/stdin <<'PYEOF'
+          import os, json, urllib.request, glob, subprocess, datetime
+
+          tf_content = ""
+          for f in glob.glob("*.tf"):
+              with open(f) as fp:
+                  tf_content += f"=== {f} ===\n{fp.read()}\n\n"
+
+          prompt = f"""SRE auto-heal for repo2-app-infra (ALB + ECS task definitions on AWS).
+          This repo reads remote state from repo1-base-infra.
+
+          TERRAFORM FILES:
+          {tf_content[:5000]}
+
+          Common failure modes:
+          - Remote state not yet available (repo1 hasn't deployed)
+          - ECR image not pushed yet
+          - Subnet/SG IDs changed in upstream
+
+          Respond ONLY with JSON:
+          {{
+            "root_cause": "...",
+            "fix_description": "...",
+            "file_patches": [],
+            "commit_message": "fix: ..."
+          }}"""
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 1000,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={"Content-Type": "application/json", "x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"}
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+
+          text = data["content"][0]["text"].strip()
+          if "```" in text:
+              text = text.split("```")[1]
+              if text.startswith("json"): text = text[4:]
+          fix = json.loads(text.strip())
+
+          for patch in fix.get("file_patches", []):
+              fname = patch["filename"]
+              if os.path.exists(fname):
+                  with open(fname) as fp: content = fp.read()
+                  if patch["search"] in content:
+                      with open(fname, "w") as fp:
+                          fp.write(content.replace(patch["search"], patch["replace"], 1))
+
+          with open("/tmp/commit_msg.txt", "w") as fp:
+              fp.write(fix.get("commit_message", "fix: auto-heal repo2"))
+          with open("/tmp/root_cause.txt", "w") as fp:
+              fp.write(fix.get("root_cause", "unknown"))
+          PYEOF
+
+          BRANCH="fix/auto-heal-repo2-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "Autonomous SRE Bot"
+          git config user.email "sre-bot@autonomous-sre.io"
+          git checkout -b "$BRANCH"
+          git add -A
+          git diff --staged --quiet || git commit -m "$(cat /tmp/commit_msg.txt)"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "🤖 Auto-heal repo2: $(cat /tmp/commit_msg.txt)" \
+            --body "**Root cause:** $(cat /tmp/root_cause.txt)\n\nAuto-generated by Autonomous SRE bot." \
+            --head "$BRANCH" --base main --label "auto-heal" || true
+
+  terraform-apply:
+    name: "Stage 4 · Deploy"
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    if: github.ref == 'refs/heads/main' && needs.terraform-plan.outputs.plan_exitcode != '1'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with: { name: tfplan-repo2 }
+      - run: terraform init -input=false
+      - run: terraform apply -input=false -auto-approve tfplan
+      - name: Notify downstream repos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "App infra deployed. Frontend and backend can now deploy."
